@@ -52,6 +52,23 @@ typedef struct {
     float pm1_0;
 } pms_dust_t;
 
+struct aqi_break {
+    float min;
+    float max;
+    int aqi_min;
+    int aqi_max;
+};
+
+struct aqi_break pm_25_breakpoints[] = {
+  {0.0, 12.0, 0, 50},
+  {12.1, 35.4, 51, 100},
+  {35.5, 55.4, 101, 150},
+  {55.5, 150.4, 151, 200},
+  {150.5, 250.4, 201, 300},
+  {250.5, 350.4, 301, 400},
+  {350.5, 500.0, 401, 500}
+};
+
 void setup(void)
 {
     uint8_t txbuf[8];
@@ -112,6 +129,14 @@ static void mqtt_send_json(const char *topic, int alive, const pms_dust_t *pms, 
 {
     static char json[128];
     char tmp[128];
+    int aqi = -1;
+
+    for(int i = 0; i < sizeof pm_25_breakpoints; i++) {
+      if (pms->pm2_5 > pm_25_breakpoints[i].min && pms->pm2_5 < pm_25_breakpoints[i].max) {
+         aqi = ((pms->pm2_5 - pm_25_breakpoints[i].min) * (pm_25_breakpoints[i].aqi_max - pm_25_breakpoints[i].aqi_min) / (pm_25_breakpoints[i].max - pm_25_breakpoints[i].min) + pm_25_breakpoints[i].aqi_min);
+         break;
+      }
+    }
     
     // header
     strcpy(json, "{");
@@ -123,8 +148,8 @@ static void mqtt_send_json(const char *topic, int alive, const pms_dust_t *pms, 
     // PMS7003
     if (pms != NULL) {
         // AMB, "standard atmosphere" particle
-        sprintf(tmp, ",\"pms7003\":{\"pm10\":%.1f,\"pm2_5\":%.1f,\"pm1_0\":%.1f}",
-                pms->pm10, pms->pm2_5, pms->pm1_0);
+        sprintf(tmp, ",\"pms7003\":{\"pm10\":%.1f,\"pm2_5\":%.1f,\"pm1_0\":%.1f, \"pm2_5aqi\":%d}",
+                pms->pm10, pms->pm2_5, pms->pm1_0, aqi);
         strcat(json, tmp);
     }
 

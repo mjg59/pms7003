@@ -23,7 +23,8 @@
 #define PIN_SDA D3
 #define PIN_SCL D4
 
-#define MEASURE_INTERVAL_MS 30000
+#define MEASURE_INTERVAL_MS 300000
+#define STABILISING_MS 30000
 
 #define MQTT_HOST   ""
 #define MQTT_PORT   1883
@@ -46,12 +47,6 @@ typedef struct {
     float pres;
 } bme_meas_t;
 
-typedef struct {
-    float pm10;
-    float pm2_5;
-    float pm1_0;
-} pms_dust_t;
-
 struct aqi_break {
     float min;
     float max;
@@ -68,6 +63,10 @@ struct aqi_break pm_25_breakpoints[] = {
   {250.5, 350.4, 301, 400},
   {350.5, 500.0, 401, 500}
 };
+
+enum pms_state {IDLE, STABILISING, WAITING};
+
+static pms_state state;
 
 void setup(void)
 {
@@ -91,9 +90,9 @@ void setup(void)
 
     // initialize the sensor
     sensor.begin(9600);
-    txlen = PmsCreateCmd(txbuf, sizeof(txbuf), PMS_CMD_ON_STANDBY, 1);
+    txlen = PmsCreateCmd(txbuf, sizeof(txbuf), PMS_CMD_AUTO_MANUAL, 0);
     sensor.write(txbuf, txlen);
-    txlen = PmsCreateCmd(txbuf, sizeof(txbuf), PMS_CMD_AUTO_MANUAL, 1);
+    txlen = PmsCreateCmd(txbuf, sizeof(txbuf), PMS_CMD_ON_STANDBY, 0);
     sensor.write(txbuf, txlen);
     PmsInit();
     
@@ -103,7 +102,9 @@ void setup(void)
     if (have_bme280) {
         Serial.println("Found BME280 sensor.");
     }
-    
+
+    state = IDLE;
+
     Serial.println("setup() done");
 }
 
@@ -139,15 +140,15 @@ static void mqtt_send_config(const char *type, const char *name, const char *uni
     mqtt_send_string(topic, json);
 }
 
-static void mqtt_send_json(const char *topic, int alive, const pms_dust_t *pms, const bme_meas_t *bme)
+static void mqtt_send_json(const char *topic, int alive, const pms_meas_t *pms, const bme_meas_t *bme)
 {
     static char json[128];
     char tmp[128];
     int aqi = -1;
 
     for(int i = 0; i < sizeof pm_25_breakpoints; i++) {
-      if (pms->pm2_5 > pm_25_breakpoints[i].min && pms->pm2_5 < pm_25_breakpoints[i].max) {
-         aqi = ((pms->pm2_5 - pm_25_breakpoints[i].min) * (pm_25_breakpoints[i].aqi_max - pm_25_breakpoints[i].aqi_min) / (pm_25_breakpoints[i].max - pm_25_breakpoints[i].min) + pm_25_breakpoints[i].aqi_min);
+      if (pms->concPM2_5_amb > pm_25_breakpoints[i].min && pms->concPM2_5_amb < pm_25_breakpoints[i].max) {
+         aqi = ((pms->concPM2_5_amb - pm_25_breakpoints[i].min) * (pm_25_breakpoints[i].aqi_max - pm_25_breakpoints[i].aqi_min) / (pm_25_breakpoints[i].max - pm_25_breakpoints[i].min) + pm_25_breakpoints[i].aqi_min);
          break;
       }
     }
@@ -162,8 +163,8 @@ static void mqtt_send_json(const char *topic, int alive, const pms_dust_t *pms, 
     // PMS7003
     if (pms != NULL) {
         // AMB, "standard atmosphere" particle
-        sprintf(tmp, ",\"pms7003\":{\"pm10\":%.1f,\"pm2_5\":%.1f,\"pm1_0\":%.1f, \"pm2_5aqi\":%d}",
-                pms->pm10, pms->pm2_5, pms->pm1_0, aqi);
+        sprintf(tmp, ",\"pms7003\":{\"pm10\":%d,\"pm2_5\":%d,\"pm1_0\":%d, \"pm2_5aqi\":%d}",
+                pms->concPM10_0_amb, pms->concPM2_5_amb, pms->concPM1_0_amb, aqi);
         strcat(json, tmp);
     }
 
@@ -182,73 +183,79 @@ static void mqtt_send_json(const char *topic, int alive, const pms_dust_t *pms, 
 
 void loop(void)
 {
-    static pms_dust_t pms_meas_sum = {0.0, 0.0, 0.0};
-    static int pms_meas_count = 0;
     static unsigned long last_sent = 0;
+    static unsigned long fan_on = 0;
     static unsigned long alive_count = 0;
+    unsigned long ms = millis();
+    uint8_t txbuf[8];
+    int txlen;
 
     // keep MQTT alive
     mqttClient.loop();
 
-    // check measurement interval
-    unsigned long ms = millis();
-    if ((ms - last_sent) > MEASURE_INTERVAL_MS) {
-        if (pms_meas_count > 0) {
-            // average dust measurement
-            pms_meas_sum.pm10 /= pms_meas_count;
-            pms_meas_sum.pm2_5 /= pms_meas_count;
-            pms_meas_sum.pm1_0 /= pms_meas_count;
-
-            mqtt_send_config("pms7003", "pm1_0", "µg/m³");
-            mqtt_send_config("pms7003", "pm2_5", "µg/m³");
-            mqtt_send_config("pms7003", "pm10", "µg/m³");
-            mqtt_send_config("pms7003", "pm2_5aqi", "AQI");
-
-            // read BME sensor
-            bme_meas_t *bme280_p;
-            if (have_bme280) {
-                bme_meas_t bme_meas;
-                bme280.read(bme_meas.pres, bme_meas.temp, bme_meas.hum);
-                bme280_p = &bme_meas;
-                mqtt_send_config("bme280", "t", "°C");
-                mqtt_send_config("bme280", "rh", "%");
-                mqtt_send_config("bme280", "p", "Pascals");
-
-            } else {
-                bme280_p = NULL;
-            }
-
-            // publish it
-            alive_count++;
-            mqtt_send_json(mqtt_state_topic, alive_count, &pms_meas_sum, bme280_p);
-
-            // reset sum
-            pms_meas_sum.pm10 = 0.0;
-            pms_meas_sum.pm2_5 = 0.0;
-            pms_meas_sum.pm1_0 = 0.0;
-            pms_meas_count = 0;
-        } else {
-            Serial.println("Not publishing, no measurement received from PMS7003!");
-            
-            // publish only the alive counter
-            mqtt_send_json(mqtt_state_topic, alive_count, NULL, NULL);
+    switch (state) {
+    case IDLE:
+        if ((ms - last_sent) > MEASURE_INTERVAL_MS) {
+            fan_on = ms;
+            txlen = PmsCreateCmd(txbuf, sizeof(txbuf), PMS_CMD_ON_STANDBY, 1);
+            sensor.write(txbuf, txlen);
+            fan_on = ms;
+            state = STABILISING;
         }
-        last_sent = ms;
-    }
+        break;
+    case STABILISING:
+        if ((ms - fan_on) > STABILISING_MS) {
+            // consume any command responses that are in the serial buffer
+            while (sensor.available()) {
+                sensor.read();
+            }
+            // trigger a measurement
+            txlen = PmsCreateCmd(txbuf, sizeof(txbuf), PMS_CMD_TRIG_MANUAL, 0);
+            sensor.write(txbuf, txlen);
+            state = WAITING;
+        }
+        break;
+    case WAITING:
+        // check for incoming measurement data
+        while (sensor.available()) {
+            uint8_t c = sensor.read();
+            if (PmsProcess(c)) {
+                // parse it
+                pms_meas_t pms_meas;
+                PmsParse(&pms_meas);
 
-    // check for incoming measurement data
-    while (sensor.available()) {
-        uint8_t c = sensor.read();
-        if (PmsProcess(c)) {
-            // parse it
-            pms_meas_t pms_meas;
-            PmsParse(&pms_meas);
-            // sum it
-            pms_meas_sum.pm10 += pms_meas.concPM10_0_amb;
-            pms_meas_sum.pm2_5 += pms_meas.concPM2_5_amb;
-            pms_meas_sum.pm1_0 += pms_meas.concPM1_0_amb;
-            pms_meas_count++;
+                mqtt_send_config("pms7003", "pm1_0", "µg/m³");
+                mqtt_send_config("pms7003", "pm2_5", "µg/m³");
+                mqtt_send_config("pms7003", "pm10", "µg/m³");
+                mqtt_send_config("pms7003", "pm2_5aqi", "AQI");
+
+                // read BME sensor
+                bme_meas_t *bme280_p;
+                if (have_bme280) {
+                    bme_meas_t bme_meas;
+                    bme280.read(bme_meas.pres, bme_meas.temp, bme_meas.hum);
+                    bme280_p = &bme_meas;
+                    mqtt_send_config("bme280", "t", "°C");
+                    mqtt_send_config("bme280", "rh", "%");
+                    mqtt_send_config("bme280", "p", "Pascals");
+                } else {
+                    bme280_p = NULL;
+                }
+
+                // publish it
+                alive_count++;
+                mqtt_send_json(mqtt_state_topic, alive_count, &pms_meas, bme280_p);
+
+                // Shut down
+                txlen = PmsCreateCmd(txbuf, sizeof(txbuf), PMS_CMD_ON_STANDBY, 0);
+                sensor.write(txbuf, txlen);
+
+                last_sent = ms;
+                fan_on = 0;
+
+                state = IDLE;
+                break;
+            }
         }
     }
 }
-

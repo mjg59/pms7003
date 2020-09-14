@@ -25,9 +25,9 @@
 
 #define MEASURE_INTERVAL_MS 30000
 
-#define MQTT_HOST   "aliensdetected.com"
+#define MQTT_HOST   ""
 #define MQTT_PORT   1883
-#define MQTT_TOPIC  "bertrik/dust"
+#define MQTT_TOPIC  "homeassistant/sensor/dust"
 
 static SoftwareSerial sensor(PIN_RX, PIN_TX);
 static WiFiClient wifiClient;
@@ -36,7 +36,7 @@ static PubSubClient mqttClient(wifiClient);
 
 static char esp_id[16];
 static char device_name[20];
-static char mqtt_topic[32];
+static char mqtt_state_topic[32];
 static boolean have_bme280;
 static BME280I2C bme280;
 
@@ -83,7 +83,7 @@ void setup(void)
     sprintf(device_name, "PMS7003-%s", esp_id);
     Serial.print("Device name: ");
     Serial.println(device_name);
-    sprintf(mqtt_topic, "%s/%s", MQTT_TOPIC, esp_id);
+    sprintf(mqtt_state_topic, "%s/state", MQTT_TOPIC);
 
     // connect to wifi or set up captive portal
     Serial.println("Starting WIFI manager ...");
@@ -123,6 +123,20 @@ static void mqtt_send_string(const char *topic, const char *string)
         bool result = mqttClient.publish(topic, string);
         Serial.println(result ? "OK" : "FAIL");
     }
+}
+
+static void mqtt_send_config(const char *type, const char *name, const char *unit)
+{
+    static char json[256];
+    char tmp[128];
+    char topic[128];
+
+    sprintf(topic, "%s%s/config", MQTT_TOPIC, name);
+
+    sprintf(json, "{\"name\": \"%s\", \"state_topic\": \"%s\", \"value_template\": \"{{ value_json.%s.%s}}\", \"unique_id\": \"%s_%s\", \"unit_of_measurement\": \"%s\"}",
+            name, mqtt_state_topic, type, name, device_name, name, unit);
+
+    mqtt_send_string(topic, json);
 }
 
 static void mqtt_send_json(const char *topic, int alive, const pms_dust_t *pms, const bme_meas_t *bme)
@@ -185,19 +199,28 @@ void loop(void)
             pms_meas_sum.pm2_5 /= pms_meas_count;
             pms_meas_sum.pm1_0 /= pms_meas_count;
 
+            mqtt_send_config("pms7003", "pm1_0", "µg/m³");
+            mqtt_send_config("pms7003", "pm2_5", "µg/m³");
+            mqtt_send_config("pms7003", "pm10", "µg/m³");
+            mqtt_send_config("pms7003", "pm2_5aqi", "AQI");
+
             // read BME sensor
             bme_meas_t *bme280_p;
             if (have_bme280) {
                 bme_meas_t bme_meas;
                 bme280.read(bme_meas.pres, bme_meas.temp, bme_meas.hum);
                 bme280_p = &bme_meas;
+                mqtt_send_config("bme280", "t", "°C");
+                mqtt_send_config("bme280", "rh", "%");
+                mqtt_send_config("bme280", "p", "Pascals");
+
             } else {
                 bme280_p = NULL;
             }
 
             // publish it
             alive_count++;
-            mqtt_send_json(mqtt_topic, alive_count, &pms_meas_sum, bme280_p);
+            mqtt_send_json(mqtt_state_topic, alive_count, &pms_meas_sum, bme280_p);
 
             // reset sum
             pms_meas_sum.pm10 = 0.0;
@@ -208,7 +231,7 @@ void loop(void)
             Serial.println("Not publishing, no measurement received from PMS7003!");
             
             // publish only the alive counter
-            mqtt_send_json(mqtt_topic, alive_count, NULL, NULL);
+            mqtt_send_json(mqtt_state_topic, alive_count, NULL, NULL);
         }
         last_sent = ms;
     }
